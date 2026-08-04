@@ -24,6 +24,7 @@ let botState = {
   startTime: Date.now(),
   errors: [],
   wasThrottled: false,
+  wasDuplicateLogin: false,
 };
 
 // Health check endpoint for monitoring
@@ -1173,8 +1174,33 @@ function getReconnectDelay() {
     return throttleDelay;
   }
 
-  // FIX: read auto-reconnect-delay from settings as base delay
-  const baseDelay = config.utils["auto-reconnect-delay"] || 3000;
+  // FIX: duplicate_login kicks mean the old session is still alive on the
+  // server. A minimum ~15-20s cooldown (with exponential backoff on repeated
+  // failures) gives the server time to fully drop the stale session instead
+  // of racing it and looping the kick every few seconds.
+  if (botState.wasDuplicateLogin) {
+    botState.wasDuplicateLogin = false;
+    const duplicateLoginBase = 15000;
+    const duplicateLoginMax = 120000;
+    const duplicateLoginDelay = Math.min(
+      duplicateLoginBase * Math.pow(2, botState.reconnectAttempts),
+      duplicateLoginMax,
+    );
+    const duplicateJitter = Math.floor(Math.random() * 5000);
+    addLog(
+      `[Bot] Duplicate login detected - using extended delay: ${(duplicateLoginDelay + duplicateJitter) / 1000}s`,
+    );
+    return duplicateLoginDelay + duplicateJitter;
+  }
+
+  // FIX: read auto-reconnect-delay from settings as base delay, but always
+  // enforce a minimum floor so we never hammer the server with rapid
+  // reconnect attempts (this is what caused the duplicate_login kick loop).
+  const minDelay = 15000;
+  const baseDelay = Math.max(
+    config.utils["auto-reconnect-delay"] || 3000,
+    minDelay,
+  );
   const maxDelay = config.utils["max-reconnect-delay"] || 30000;
   const delay = Math.min(
     baseDelay * Math.pow(2, botState.reconnectAttempts),
@@ -1268,32 +1294,40 @@ function createBot() {
         );
       }
 
-      // FIX: use bot.version (auto-detected) instead of config value so minecraft-data always matches
-      const mcData = require("minecraft-data")(bot.version);
-      const defaultMove = new Movements(bot, mcData);
-      defaultMove.allowFreeMotion = false;
-      defaultMove.canDig = false;
-      defaultMove.liquidCost = 1000;
-      defaultMove.fallDamageCost = 1000;
-
-      initializeModules(bot, mcData, defaultMove);
-
-      // Attempt creative mode (only works if bot has OP and enabled in settings)
+      // FIX: give the connection a brief moment to stabilize before we start
+      // doing anything (chatting, pathfinding, etc.). Some servers briefly
+      // hold the connection in a semi-ready state right after spawn, and
+      // acting too early can trigger odd server-side behavior.
       setTimeout(() => {
-        if (bot && botState.connected && config.server["try-creative"]) {
-          bot.chat("/gamemode creative");
-          addLog("[INFO] Attempted to set creative mode (requires OP)");
-        }
-      }, 3000);
+        if (!bot || !botState.connected) return;
 
-      bot.on("messagestr", (message) => {
-        if (
-          message.includes("commands.gamemode.success.self") ||
-          message.includes("Set own game mode to Creative Mode")
-        ) {
-          addLog("[INFO] Bot is now in Creative Mode.");
-        }
-      });
+        // FIX: use bot.version (auto-detected) instead of config value so minecraft-data always matches
+        const mcData = require("minecraft-data")(bot.version);
+        const defaultMove = new Movements(bot, mcData);
+        defaultMove.allowFreeMotion = false;
+        defaultMove.canDig = false;
+        defaultMove.liquidCost = 1000;
+        defaultMove.fallDamageCost = 1000;
+
+        initializeModules(bot, mcData, defaultMove);
+
+        // Attempt creative mode (only works if bot has OP and enabled in settings)
+        setTimeout(() => {
+          if (bot && botState.connected && config.server["try-creative"]) {
+            bot.chat("/gamemode creative");
+            addLog("[INFO] Attempted to set creative mode (requires OP)");
+          }
+        }, 3000);
+
+        bot.on("messagestr", (message) => {
+          if (
+            message.includes("commands.gamemode.success.self") ||
+            message.includes("Set own game mode to Creative Mode")
+          ) {
+            addLog("[INFO] Bot is now in Creative Mode.");
+          }
+        });
+      }, 2000);
     });
 
     // FIX: 'kicked' fires before 'end'. Remove the scheduleReconnect from 'kicked'
@@ -1323,6 +1357,21 @@ function createBot() {
         botState.wasThrottled = true;
       }
 
+      // FIX: duplicate_login kicks mean the server still has our old session
+      // active. Reconnecting immediately just re-triggers the same kick in a
+      // tight loop, so force a longer minimum cooldown to let the server
+      // fully drop the stale session before we try again.
+      if (
+        reasonStr.includes("duplicate_login") ||
+        reasonStr.includes("duplicate login") ||
+        reasonStr.includes("logged in from another location")
+      ) {
+        addLog(
+          "[Bot] Duplicate login kick detected - forcing extended reconnect cooldown",
+        );
+        botState.wasDuplicateLogin = true;
+      }
+
       if (
         config.discord &&
         config.discord.events &&
@@ -1339,6 +1388,11 @@ function createBot() {
       botState.connected = false;
       clearAllIntervals();
       spawnHandled = false; // reset for next connection
+
+      // FIX: null out the bot reference as soon as the session ends so no
+      // stale instance lingers around while we wait to reconnect. createBot()
+      // will build a brand new instance once the cooldown elapses.
+      bot = null;
 
       if (
         config.discord &&
